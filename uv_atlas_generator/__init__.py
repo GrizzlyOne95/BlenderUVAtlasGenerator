@@ -15,7 +15,6 @@ bl_info = {
 import bpy
 import bmesh
 import math
-import mathutils
 import numpy as np
 from collections import defaultdict
 from bpy.props import IntProperty, BoolProperty, EnumProperty
@@ -123,9 +122,9 @@ class UVAtlasSettings(PropertyGroup):
         name="Packing Algorithm",
         description="Algorithm for packing texture regions",
         items=[
-            ('SIMPLE', "Simple Rows", "Pack in simple rows (fastest)"),
-            ('SIZE_SORTED', "Size Sorted", "Sort by size before packing"),
-            ('BEST_FIT', "Best Fit", "Try to minimize wasted space"),
+            ('SIMPLE', "Insertion Order", "MaxRects packing with original order"),
+            ('SIZE_SORTED', "Size Sorted", "MaxRects packing, sorted by area"),
+            ('BEST_FIT', "Best Fit", "MaxRects packing, sorted by long edge"),
         ],
         default='SIZE_SORTED'
     )
@@ -134,6 +133,12 @@ class UVAtlasSettings(PropertyGroup):
         name="Allow Rotation", 
         description="Allow rotating regions 90° for better packing",
         default=False
+    )
+
+    rotation_safe_only: BoolProperty(
+        name="Rotation Safe Only",
+        description="Only rotate regions with axis-aligned UVs",
+        default=True
     )
     
     # === UV PROCESSING ===
@@ -167,6 +172,32 @@ class UVAtlasSettings(PropertyGroup):
             ('USE_EXISTING', "Use Existing", "Use existing image if it exists"),
         ],
         default='CREATE_NEW'
+    )
+
+    output_dir: bpy.props.StringProperty(
+        name="Output Directory",
+        description="Directory to save atlas images (blank = blend file directory)",
+        subtype='DIR_PATH',
+        default=""
+    )
+
+    atlas_name_preset: EnumProperty(
+        name="Name Preset",
+        description="Preset for atlas naming",
+        items=[
+            ('ATLAS', "Atlas Only", "{atlas}"),
+            ('OBJECT_ATLAS', "Object + Atlas", "{object}_{atlas}"),
+            ('OBJECT_TIMESTAMP', "Object + Timestamp", "{object}_{timestamp}"),
+            ('ATLAS_TIMESTAMP', "Atlas + Timestamp", "{atlas}_{timestamp}"),
+            ('CUSTOM', "Custom Template", "{custom}"),
+        ],
+        default='OBJECT_ATLAS'
+    )
+
+    atlas_name_template: bpy.props.StringProperty(
+        name="Name Template",
+        description="Custom name template using {object}, {atlas}, {timestamp}",
+        default="{object}_{atlas}"
     )
     
     save_atlas_file: BoolProperty(
@@ -312,95 +343,85 @@ class UV_ATLAS_OT_generate(Operator):
     
     def generate_atlas(self, context, settings):
         """Main atlas generation function"""
-        obj = context.object
-        
-        if not obj or obj.type != 'MESH':
-            raise Exception("No mesh object selected")
-        
-        if not obj.data.materials:
-            raise Exception("Object has no materials")
-        
-        mesh = obj.data
-        bm = bmesh.new()
-        try:
-            bm.from_mesh(mesh)
-            uv_layer = bm.loops.layers.uv.verify()
-            bm.faces.ensure_lookup_table()
-            
-            if settings.debug_mode:
-                print(f"Processing mesh: {obj.name}")
-                print(f"Faces: {len(bm.faces)}, Materials: {len(obj.data.materials)}")
-            
-            # Group faces by image and detect mirroring needs
-            material_groups = self.group_faces_by_material(bm, obj, uv_layer, settings)
-            
-            if not material_groups:
-                raise Exception("No valid materials with textures found")
-            
-            if settings.debug_mode:
-                print(f"Found {len(material_groups)} unique textures")
-            
-            # Create texture regions
-            total_regions = self.create_texture_regions(material_groups, settings, uv_layer)
-            
-            if not total_regions:
-                raise Exception("No texture regions created")
-            
-            # Calculate optimal atlas size
-            atlas_size = self.calculate_atlas_size(total_regions, settings)
-            
-            if settings.debug_mode:
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs:
+            raise Exception("No mesh objects selected")
+
+        for obj in objs:
+            if not obj.data.materials:
+                raise Exception(f"Object has no materials: {obj.name}")
+
+            mesh = obj.data
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(mesh)
+                uv_layer = bm.loops.layers.uv.verify()
+                bm.faces.ensure_lookup_table()
+                
+                if settings.debug_mode:
+                    print(f"Processing mesh: {obj.name}")
+                    print(f"Faces: {len(bm.faces)}, Materials: {len(obj.data.materials)}")
+                
+                # Group faces by image and detect mirroring needs
+                material_groups = self.group_faces_by_material(bm, obj, uv_layer, settings)
+                
+                if not material_groups:
+                    raise Exception(f"No valid materials with textures found on {obj.name}")
+                
+                if settings.debug_mode:
+                    print(f"Found {len(material_groups)} unique textures")
+                
+                # Create texture regions
+                total_regions = self.create_texture_regions(material_groups, settings, uv_layer)
+                
+                if not total_regions:
+                    raise Exception(f"No texture regions created for {obj.name}")
+                
+                # Calculate optimal atlas size
+                atlas_size = self.calculate_atlas_size(total_regions, settings)
+                
+                if settings.debug_mode:
+                    if isinstance(atlas_size, tuple):
+                        print(f"Using atlas size: {atlas_size[0]}x{atlas_size[1]}")
+                    else:
+                        print(f"Using atlas size: {atlas_size}x{atlas_size}")
+                
+                # Build the atlas
+                atlas_image, atlas_regions = self.build_atlas(total_regions, atlas_size, settings, obj)
+                
+                # Handle both square and rectangular atlas sizes
                 if isinstance(atlas_size, tuple):
-                    print(f"Using atlas size: {atlas_size[0]}x{atlas_size[1]}")
+                    atlas_width, atlas_height = atlas_size
                 else:
-                    print(f"Using atlas size: {atlas_size}x{atlas_size}")
-            
-            # Build the atlas
-            atlas_image, atlas_regions = self.build_atlas(total_regions, atlas_size, settings)
-            
-            # Handle both square and rectangular atlas sizes
-            if isinstance(atlas_size, tuple):
-                atlas_width, atlas_height = atlas_size
-            else:
-                atlas_width = atlas_height = atlas_size
-            
-            # Remap UVs
-            self.remap_uvs(atlas_regions, bm, uv_layer, atlas_width, atlas_height)
-            
-            # Create new material
-            if settings.create_new_material:
-                # Create simple atlas material
-                mat = bpy.data.materials.new(name=settings.material_name)
-                mat.use_nodes = True
-                bsdf = mat.node_tree.nodes.get("Principled BSDF")
-                tex_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
-                tex_node.image = atlas_image
-                mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
+                    atlas_width = atlas_height = atlas_size
                 
-                # Replace all materials with atlas material
-                obj.data.materials.clear()
-                obj.data.materials.append(mat)
-                for face in bm.faces:
-                    face.material_index = 0
-            
-            # Update mesh
-            bm.to_mesh(mesh)
-            
-            efficiency = (sum(r['width'] * r['height'] for r in total_regions) / (atlas_width * atlas_height)) * 100
-            
-            if settings.debug_mode:
-                print(f"✅ Optimized atlas complete!")
-                print(f"📊 Final atlas size: {atlas_width}x{atlas_height}")
-                print(f"📦 Total regions packed: {len(total_regions)}")
-                print(f"📈 Atlas efficiency: {efficiency:.1f}%")
+                # Remap UVs
+                self.remap_uvs(atlas_regions, bm, uv_layer, atlas_width, atlas_height, settings)
                 
-        except Exception as e:
-            if bm.is_valid:
-                bm.free()
-            raise e
-        finally:
-            if bm.is_valid:
-                bm.free()
+                # Create materials
+                if settings.create_debug_materials:
+                    self.apply_debug_materials(obj, bm, atlas_regions, settings)
+                elif settings.create_new_material:
+                    self.apply_atlas_material(obj, bm, atlas_image, settings)
+                
+                # Update mesh
+                bm.to_mesh(mesh)
+                
+                efficiency = (sum(r['width'] * r['height'] for r in total_regions) / (atlas_width * atlas_height)) * 100
+                
+                if settings.debug_mode:
+                    print(f"✅ Optimized atlas complete for {obj.name}!")
+                    print(f"📊 Final atlas size: {atlas_width}x{atlas_height}")
+                    print(f"📦 Total regions packed: {len(total_regions)}")
+                    print(f"📈 Atlas efficiency: {efficiency:.1f}%")
+                    
+            except Exception as e:
+                if bm.is_valid:
+                    bm.free()
+                raise e
+            finally:
+                if bm.is_valid:
+                    bm.free()
     
     def is_face_uv_mirrored(self, face, uv_layer):
         """Check if face has mirrored UV coordinates (negative winding)"""
@@ -473,18 +494,25 @@ class UV_ATLAS_OT_generate(Operator):
         
         return material_groups
     
-    def compute_uv_bounds(self, face_group, uv_layer):
+    def normalize_uv(self, uv, settings):
+        """Normalize UVs to 0-1 range if enabled."""
+        if not settings.normalize_uv_ranges:
+            return uv.x, uv.y
+        return uv.x % 1.0, uv.y % 1.0
+
+    def compute_uv_bounds(self, face_group, uv_layer, settings):
         """Compute UV bounds for a group of faces"""
         all_uvs = []
         for item in face_group:
-            face_uvs = [loop[uv_layer].uv.copy() for loop in item['face'].loops]
-            all_uvs.extend(face_uvs)
+            for loop in item['face'].loops:
+                u, v = self.normalize_uv(loop[uv_layer].uv, settings)
+                all_uvs.append((u, v))
         
         if not all_uvs:
             return 0, 1, 0, 1
         
-        u_coords = [uv.x for uv in all_uvs]
-        v_coords = [uv.y for uv in all_uvs]
+        u_coords = [uv[0] for uv in all_uvs]
+        v_coords = [uv[1] for uv in all_uvs]
         return min(u_coords), max(u_coords), min(v_coords), max(v_coords)
     
     def create_region_texture(self, src_pixels, img_size, u_min, u_max, v_min, v_max, settings, region_type='regular'):
@@ -557,7 +585,8 @@ class UV_ATLAS_OT_generate(Operator):
             
             # Process regular faces
             if groups['regular']:
-                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['regular'], uv_layer)
+                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['regular'], uv_layer, settings)
+                allow_rotate = self.is_region_rotation_safe(groups['regular'], uv_layer) if settings.rotation_safe_only else True
                 region_pixels, region_w, region_h = self.create_region_texture(
                     src_pixels, img.size, u_min, u_max, v_min, v_max, settings, region_type='regular'
                 )
@@ -570,13 +599,15 @@ class UV_ATLAS_OT_generate(Operator):
                     'height': region_h,
                     'u_min': u_min, 'u_max': u_max,
                     'v_min': v_min, 'v_max': v_max,
-                    'faces': groups['regular']
+                    'faces': groups['regular'],
+                    'allow_rotate': allow_rotate
                 }
                 total_regions.append(region_info)
             
             # Process mirrored faces (horizontally flipped)
             if groups['mirrored']:
-                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['mirrored'], uv_layer)
+                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['mirrored'], uv_layer, settings)
+                allow_rotate = self.is_region_rotation_safe(groups['mirrored'], uv_layer) if settings.rotation_safe_only else True
                 region_pixels, region_w, region_h = self.create_region_texture(
                     src_pixels, img.size, u_min, u_max, v_min, v_max, settings, region_type='mirrored'
                 )
@@ -589,11 +620,38 @@ class UV_ATLAS_OT_generate(Operator):
                     'height': region_h,
                     'u_min': u_min, 'u_max': u_max,
                     'v_min': v_min, 'v_max': v_max,
-                    'faces': groups['mirrored']
+                    'faces': groups['mirrored'],
+                    'allow_rotate': allow_rotate
                 }
                 total_regions.append(region_info)
         
+        if settings.merge_identical_uvs:
+            total_regions = self.merge_identical_regions(total_regions, settings)
+
         return total_regions
+
+    def merge_identical_regions(self, regions, settings):
+        """Merge regions that share the same UV bounds and image."""
+        merged = {}
+
+        def q(v):
+            return round(v, settings.uv_precision)
+
+        for region in regions:
+            key = (
+                region['img_name'],
+                region['type'],
+                q(region['u_min']), q(region['u_max']),
+                q(region['v_min']), q(region['v_max']),
+                region['width'], region['height'],
+            )
+            existing = merged.get(key)
+            if not existing:
+                merged[key] = region
+                continue
+            existing['faces'].extend(region['faces'])
+
+        return list(merged.values())
     
     def calculate_atlas_size(self, regions, settings):
         """Calculate minimum atlas size needed for all regions"""
@@ -609,10 +667,14 @@ class UV_ATLAS_OT_generate(Operator):
         if settings.allow_non_power_of_2:
             # Allow any size, start from minimum
             atlas_size = max(64, min_size)
+            fit = False
             while atlas_size <= settings.max_atlas_size:
-                if self.test_packing(regions, atlas_size, settings.padding):
+                if self.test_packing(regions, atlas_size, settings.padding, allow_rotate=settings.allow_region_rotation):
+                    fit = True
                     break
                 atlas_size += 64  # Increment by 64
+            if not fit:
+                raise Exception("Regions do not fit within max atlas size")
         else:
             # Force power of 2
             atlas_size = 64
@@ -620,10 +682,14 @@ class UV_ATLAS_OT_generate(Operator):
                 atlas_size *= 2
             
             # Test if regions actually fit
+            fit = False
             while atlas_size <= settings.max_atlas_size:
-                if self.test_packing(regions, atlas_size, settings.padding):
+                if self.test_packing(regions, atlas_size, settings.padding, allow_rotate=settings.allow_region_rotation):
+                    fit = True
                     break
                 atlas_size *= 2
+            if not fit:
+                raise Exception("Regions do not fit within max atlas size")
         
         if not settings.force_square and settings.allow_non_power_of_2:
             # Try rectangular layouts for better efficiency
@@ -631,44 +697,167 @@ class UV_ATLAS_OT_generate(Operator):
                 for height in range(atlas_size, settings.max_atlas_size + 1, 64):
                     if width * height < atlas_size * atlas_size:
                         continue
-                    if self.test_packing_rectangular(regions, width, height, settings.padding):
+                    if self.test_packing_rectangular(regions, width, height, settings.padding, allow_rotate=settings.allow_region_rotation):
                         return (width, height)
         
         return atlas_size if isinstance(atlas_size, int) else min(atlas_size, settings.max_atlas_size)
     
-    def resolve_atlas_name(self, base_name, atlas_width, atlas_height, settings):
-        """Resolve atlas name conflicts based on user settings"""
+    def build_atlas_name(self, settings, obj):
+        template = settings.atlas_name_template
+        if settings.atlas_name_preset == 'ATLAS':
+            template = "{atlas}"
+        elif settings.atlas_name_preset == 'OBJECT_ATLAS':
+            template = "{object}_{atlas}"
+        elif settings.atlas_name_preset == 'OBJECT_TIMESTAMP':
+            template = "{object}_{timestamp}"
+        elif settings.atlas_name_preset == 'ATLAS_TIMESTAMP':
+            template = "{atlas}_{timestamp}"
+        elif settings.atlas_name_preset == 'CUSTOM':
+            template = settings.atlas_name_template
+
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return template.format(
+            object=obj.name if obj else "Object",
+            atlas=settings.atlas_name,
+            timestamp=timestamp
+        )
+
+    def get_or_create_atlas_image(self, settings, atlas_width, atlas_height, obj=None):
+        """Create or reuse atlas image based on name handling settings."""
+        base_name = self.build_atlas_name(settings, obj)
         existing_image = bpy.data.images.get(base_name)
         
-        if not existing_image:
-            # No conflict, use the base name
-            return base_name
-        
-        if settings.atlas_name_handling == 'OVERWRITE':
-            # Remove existing image and use the same name
-            if settings.debug_mode:
-                print(f"🗑️ Removing existing image: {base_name}")
-            bpy.data.images.remove(existing_image)
-            return base_name
-            
-        elif settings.atlas_name_handling == 'USE_EXISTING':
-            # Check if existing image has compatible dimensions
-            if (existing_image.size[0] == atlas_width and 
-                existing_image.size[1] == atlas_height):
+        if existing_image:
+            if settings.atlas_name_handling == 'OVERWRITE':
                 if settings.debug_mode:
-                    print(f"♻️ Reusing existing image: {base_name}")
-                return base_name
-            else:
+                    print(f"🗑️ Removing existing image: {base_name}")
+                bpy.data.images.remove(existing_image)
+                existing_image = None
+            elif settings.atlas_name_handling == 'USE_EXISTING':
+                if (existing_image.size[0] == atlas_width and 
+                    existing_image.size[1] == atlas_height):
+                    if settings.debug_mode:
+                        print(f"♻️ Reusing existing image: {base_name}")
+                    return existing_image, base_name
                 if settings.debug_mode:
                     print(f"⚠️ Existing image {base_name} has wrong size ({existing_image.size[0]}x{existing_image.size[1]} vs {atlas_width}x{atlas_height}), creating new")
-                # Fall back to creating new with unique name
-                return self.generate_unique_name(base_name)
-                
-        elif settings.atlas_name_handling == 'CREATE_NEW':
-            # Generate a unique name
-            return self.generate_unique_name(base_name)
+                existing_image = None
+                base_name = self.generate_unique_name(base_name)
+            elif settings.atlas_name_handling == 'CREATE_NEW':
+                existing_image = None
+                base_name = self.generate_unique_name(base_name)
         
-        return base_name
+        atlas_image = bpy.data.images.new(base_name, width=atlas_width, height=atlas_height)
+        return atlas_image, base_name
+
+    def pack_regions_maxrects(self, regions, width, height, padding, allow_rotate=False):
+        """Pack regions using a basic MaxRects (best area fit) heuristic."""
+        if padding < 0:
+            padding = 0
+
+        padded = []
+        for r in regions:
+            rw = r['width'] + padding * 2
+            rh = r['height'] + padding * 2
+            padded.append((r, rw, rh))
+
+        free = [(0, 0, width, height)]
+        placements = []
+
+        def score_fit(fw, fh, rw, rh):
+            return (fw * fh) - (rw * rh)
+
+        def split_free_rect(fx, fy, fw, fh, px, py, pw, ph):
+            new_free = []
+            if px > fx:
+                new_free.append((fx, fy, px - fx, fh))
+            if px + pw < fx + fw:
+                new_free.append((px + pw, fy, (fx + fw) - (px + pw), fh))
+            if py > fy:
+                new_free.append((fx, fy, fw, py - fy))
+            if py + ph < fy + fh:
+                new_free.append((fx, py + ph, fw, (fy + fh) - (py + ph)))
+            return new_free
+
+        def prune_free(free_rects):
+            pruned = []
+            for i, a in enumerate(free_rects):
+                ax, ay, aw, ah = a
+                contained = False
+                for j, b in enumerate(free_rects):
+                    if i == j:
+                        continue
+                    bx, by, bw, bh = b
+                    if ax >= bx and ay >= by and ax + aw <= bx + bw and ay + ah <= by + bh:
+                        contained = True
+                        break
+                if not contained and aw > 0 and ah > 0:
+                    pruned.append(a)
+            return pruned
+
+        # Place larger regions first
+        padded.sort(key=lambda x: x[1] * x[2], reverse=True)
+
+        for region, rw, rh in padded:
+            best = None
+            best_score = None
+
+            region_allow_rotate = allow_rotate and region.get('allow_rotate', True)
+            for fx, fy, fw, fh in free:
+                # No rotation
+                if rw <= fw and rh <= fh:
+                    score = score_fit(fw, fh, rw, rh)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best = (fx, fy, rw, rh, False)
+                # Rotation
+                if region_allow_rotate and rh <= fw and rw <= fh:
+                    score = score_fit(fw, fh, rh, rw)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best = (fx, fy, rh, rw, True)
+
+            if best is None:
+                return None
+
+            fx, fy, pw, ph, rotated = best
+            px = fx + padding
+            py = fy + padding
+            
+            if rotated:
+                place_w, place_h = region['height'], region['width']
+            else:
+                place_w, place_h = region['width'], region['height']
+
+            placements.append((region, (px, py, place_w, place_h, rotated)))
+
+            new_free = []
+            for rx, ry, rw0, rh0 in free:
+                if not (fx < rx + rw0 and fx + pw > rx and fy < ry + rh0 and fy + ph > ry):
+                    new_free.append((rx, ry, rw0, rh0))
+                    continue
+                new_free.extend(split_free_rect(rx, ry, rw0, rh0, fx, fy, pw, ph))
+
+            free = prune_free(new_free)
+
+        return placements
+
+    def is_region_rotation_safe(self, face_group, uv_layer, tol=1e-6):
+        """Only allow rotation if all UV edges are axis-aligned."""
+        for item in face_group:
+            face = item['face']
+            loops = list(face.loops)
+            if len(loops) < 3:
+                continue
+            for i in range(len(loops)):
+                uv1 = loops[i][uv_layer].uv
+                uv2 = loops[(i + 1) % len(loops)][uv_layer].uv
+                du = abs(uv2.x - uv1.x)
+                dv = abs(uv2.y - uv1.y)
+                if du > tol and dv > tol:
+                    return False
+        return True
     
     def generate_unique_name(self, base_name):
         """Generate a unique name by appending numbers"""
@@ -686,47 +875,17 @@ class UV_ATLAS_OT_generate(Operator):
                 timestamp = int(time.time()) % 10000
                 return f"{base_name}_{timestamp}"
     
-    def test_packing_rectangular(self, regions, width, height, padding):
-        """Test if regions can fit in a rectangular atlas"""
-        offset_x = padding
-        offset_y = padding
-        row_height = 0
-        
-        for region in regions:
-            if offset_x + region['width'] + padding > width:
-                offset_x = padding
-                offset_y += row_height + padding
-                row_height = 0
-            
-            if offset_y + region['height'] + padding > height:
-                return False
-            
-            offset_x += region['width'] + padding
-            row_height = max(row_height, region['height'])
-        
-        return True
+    def test_packing_rectangular(self, regions, width, height, padding, allow_rotate=False):
+        """Test if regions can fit in a rectangular atlas using MaxRects."""
+        packed = self.pack_regions_maxrects(regions, width, height, padding, allow_rotate=allow_rotate)
+        return packed is not None
     
-    def test_packing(self, regions, atlas_size, padding):
-        """Test if regions can fit in the given atlas size"""
-        offset_x = padding
-        offset_y = padding
-        row_height = 0
-        
-        for region in regions:
-            if offset_x + region['width'] + padding > atlas_size:
-                offset_x = padding
-                offset_y += row_height + padding
-                row_height = 0
-            
-            if offset_y + region['height'] + padding > atlas_size:
-                return False
-            
-            offset_x += region['width'] + padding
-            row_height = max(row_height, region['height'])
-        
-        return True
+    def test_packing(self, regions, atlas_size, padding, allow_rotate=False):
+        """Test if regions can fit in the given atlas size using MaxRects."""
+        packed = self.pack_regions_maxrects(regions, atlas_size, atlas_size, padding, allow_rotate=allow_rotate)
+        return packed is not None
     
-    def build_atlas(self, total_regions, atlas_size, settings):
+    def build_atlas(self, total_regions, atlas_size, settings, obj):
         """Build the atlas texture"""
         # Handle both square and rectangular atlas sizes
         if isinstance(atlas_size, tuple):
@@ -741,64 +900,55 @@ class UV_ATLAS_OT_generate(Operator):
             total_regions.sort(key=lambda r: max(r['width'], r['height']), reverse=True)
         
         # Handle atlas image naming and conflicts
-        final_atlas_name = self.resolve_atlas_name(settings.atlas_name, atlas_width, atlas_height, settings)
-        
-        atlas_image = bpy.data.images.new(final_atlas_name, width=atlas_width, height=atlas_height)
+        atlas_image, final_atlas_name = self.get_or_create_atlas_image(settings, atlas_width, atlas_height, obj)
         atlas_pixels = np.zeros((atlas_height, atlas_width, 4), dtype=np.float32)
         atlas_regions = {}
-        
-        offset_x = settings.padding
-        offset_y = settings.padding
-        row_height = 0
-        
-        for region in total_regions:
-            # Check if we need to move to next row
-            if offset_x + region['width'] + settings.padding > atlas_width:
-                offset_x = settings.padding
-                offset_y += row_height + settings.padding
-                row_height = 0
-            
-            # For best fit packing, try rotating region if it helps
-            rotated = False
-            if (settings.packing_algorithm == 'BEST_FIT' and 
-                settings.allow_region_rotation and
-                offset_x + region['height'] + settings.padding <= atlas_width and
-                offset_y + region['width'] + settings.padding <= atlas_height and
-                region['width'] > region['height']):
-                # Rotate region 90 degrees
-                region['pixels'] = np.rot90(region['pixels'])
-                region['width'], region['height'] = region['height'], region['width']
-                rotated = True
-            
-            # Copy region pixels to atlas
-            for row in range(region['height']):
-                for col in range(region['width']):
-                    atlas_x = offset_x + col
-                    atlas_y = offset_y + row
+
+        packed = self.pack_regions_maxrects(
+            total_regions,
+            atlas_width,
+            atlas_height,
+            settings.padding,
+            allow_rotate=settings.allow_region_rotation
+        )
+        if packed is None:
+            raise Exception("Packing failed for computed atlas size")
+
+        for region, placement in packed:
+            px, py, pw, ph, rotated = placement
+
+            region_pixels = region['pixels']
+            if rotated:
+                region_pixels = np.rot90(region_pixels)
+
+            for row in range(ph):
+                for col in range(pw):
+                    atlas_x = px + col
+                    atlas_y = py + row
                     if atlas_x < atlas_width and atlas_y < atlas_height:
-                        atlas_pixels[atlas_y, atlas_x] = region['pixels'][row, col]
-            
+                        atlas_pixels[atlas_y, atlas_x] = region_pixels[row, col]
+
             # Store region info for UV remapping
             region_key = f"{region['img_name']}_{region['type']}"
             atlas_regions[region_key] = {
-                'atlas_x': offset_x, 'atlas_y': offset_y,
-                'width': region['width'], 'height': region['height'],
+                'atlas_x': px, 'atlas_y': py,
+                'width': pw, 'height': ph,
                 'u_min': region['u_min'], 'u_max': region['u_max'],
                 'v_min': region['v_min'], 'v_max': region['v_max'],
                 'faces': region['faces'],
                 'type': region['type'],
                 'rotated': rotated
             }
-            
-            offset_x += region['width'] + settings.padding
-            row_height = max(row_height, region['height'])
         
         # Write pixels to Blender image
         atlas_image.pixels = atlas_pixels.flatten().tolist()
         
         # Save atlas file if requested
         if settings.save_atlas_file:
-            atlas_image.filepath_raw = f"//{final_atlas_name}.{settings.atlas_format.lower()}"
+            base_path = settings.output_dir if settings.output_dir else "//"
+            if base_path and not base_path.endswith(("/", "\\")):
+                base_path = base_path + "/"
+            atlas_image.filepath_raw = f"{base_path}{final_atlas_name}.{settings.atlas_format.lower()}"
             atlas_image.file_format = settings.atlas_format
             atlas_image.save()
         
@@ -807,17 +957,21 @@ class UV_ATLAS_OT_generate(Operator):
         
         return atlas_image, atlas_regions
     
-    def remap_uvs(self, atlas_regions, bm, uv_layer, atlas_width, atlas_height):
+    def remap_uvs(self, atlas_regions, bm, uv_layer, atlas_width, atlas_height, settings):
         """Remap UVs to atlas coordinates"""
         for region_key, region in atlas_regions.items():
             for item in region['faces']:
                 face = item['face']
                 for loop in face.loops:
                     old_uv = loop[uv_layer].uv
+                    if settings.normalize_uv_ranges:
+                        old_u, old_v = self.normalize_uv(old_uv, settings)
+                    else:
+                        old_u, old_v = old_uv.x, old_uv.y
                     
                     # Calculate normalized coordinates within the original UV region
-                    u_norm = (old_uv.x - region['u_min']) / max(0.001, region['u_max'] - region['u_min'])
-                    v_norm = (old_uv.y - region['v_min']) / max(0.001, region['v_max'] - region['v_min'])
+                    u_norm = (old_u - region['u_min']) / max(0.001, region['u_max'] - region['u_min'])
+                    v_norm = (old_v - region['v_min']) / max(0.001, region['v_max'] - region['v_min'])
                     
                     # Handle rotation if region was rotated during packing
                     if region.get('rotated', False):
@@ -833,18 +987,50 @@ class UV_ATLAS_OT_generate(Operator):
                     
                     loop[uv_layer].uv = (new_u, new_v)
     
-    def create_atlas_material(self, obj, atlas_image):
+    def apply_atlas_material(self, obj, bm, atlas_image, settings):
         """Create new material with atlas texture"""
-        mat = bpy.data.materials.new(name="AtlasMaterial")
+        mat = bpy.data.materials.new(name=settings.material_name)
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get("Principled BSDF")
         tex_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
         tex_node.image = atlas_image
         mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
         
-        # Replace all materials with atlas material
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+        if settings.preserve_original_materials:
+            mat_index = len(obj.data.materials)
+            obj.data.materials.append(mat)
+        else:
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+            mat_index = 0
+        
+        for face in bm.faces:
+            face.material_index = mat_index
+
+    def apply_debug_materials(self, obj, bm, atlas_regions, settings):
+        """Create colored materials to visualize region assignments."""
+        def color_from_key(key):
+            h = abs(hash(key))
+            return ((h & 0xFF) / 255.0, ((h >> 8) & 0xFF) / 255.0, ((h >> 16) & 0xFF) / 255.0, 1.0)
+
+        if not settings.preserve_original_materials:
+            obj.data.materials.clear()
+
+        region_materials = {}
+        for region_key, region in atlas_regions.items():
+            if region_key not in region_materials:
+                mat = bpy.data.materials.new(name=f"Region_{region_key}")
+                mat.use_nodes = True
+                bsdf = mat.node_tree.nodes.get("Principled BSDF")
+                if bsdf:
+                    bsdf.inputs['Base Color'].default_value = color_from_key(region_key)
+                mat_index = len(obj.data.materials)
+                obj.data.materials.append(mat)
+                region_materials[region_key] = mat_index
+
+            mat_index = region_materials[region_key]
+            for item in region['faces']:
+                item['face'].material_index = mat_index
 
 
 class UV_ATLAS_PT_panel(Panel):
@@ -863,7 +1049,12 @@ class UV_ATLAS_PT_panel(Panel):
         obj = context.object
         if obj and obj.type == 'MESH':
             box = layout.box()
-            box.label(text=f"Selected: {obj.name}", icon='OBJECT_DATA')
+            selected_meshes = [o for o in context.selected_objects if o.type == 'MESH']
+            if len(selected_meshes) > 1:
+                box.label(text=f"Selected: {len(selected_meshes)} mesh objects", icon='OBJECT_DATA')
+                box.label(text=f"Active: {obj.name}")
+            else:
+                box.label(text=f"Selected: {obj.name}", icon='OBJECT_DATA')
             box.label(text=f"Faces: {len(obj.data.polygons)}")
             box.label(text=f"Materials: {len(obj.data.materials)}")
         else:
@@ -876,22 +1067,43 @@ class UV_ATLAS_PT_panel(Panel):
         
         col = layout.column(align=True)
         col.prop(settings, "atlas_name")
+        col.prop(settings, "atlas_name_preset")
+        if settings.atlas_name_preset == 'CUSTOM':
+            col.prop(settings, "atlas_name_template")
         col.prop(settings, "atlas_name_handling")
         
         # Show info about name handling
-        existing_img = bpy.data.images.get(settings.atlas_name)
+        template = settings.atlas_name_template
+        if settings.atlas_name_preset == 'ATLAS':
+            template = "{atlas}"
+        elif settings.atlas_name_preset == 'OBJECT_ATLAS':
+            template = "{object}_{atlas}"
+        elif settings.atlas_name_preset == 'OBJECT_TIMESTAMP':
+            template = "{object}_{timestamp}"
+        elif settings.atlas_name_preset == 'ATLAS_TIMESTAMP':
+            template = "{atlas}_{timestamp}"
+        elif settings.atlas_name_preset == 'CUSTOM':
+            template = settings.atlas_name_template
+
+        preview_name = template.format(
+            object=obj.name if obj else "Object",
+            atlas=settings.atlas_name,
+            timestamp="YYYYMMDD_HHMMSS"
+        )
+        existing_img = bpy.data.images.get(preview_name)
         if existing_img:
             box = layout.box()
             if settings.atlas_name_handling == 'OVERWRITE':
-                box.label(text=f"⚠️ Will overwrite existing '{settings.atlas_name}'", icon='ERROR')
+                box.label(text=f"⚠️ Will overwrite existing '{preview_name}'", icon='ERROR')
             elif settings.atlas_name_handling == 'CREATE_NEW':
-                box.label(text=f"📝 Will create new name (e.g. '{settings.atlas_name}.001')", icon='INFO')
+                box.label(text=f"📝 Will create new name (e.g. '{preview_name}.001')", icon='INFO')
             elif settings.atlas_name_handling == 'USE_EXISTING':
-                box.label(text=f"♻️ Will reuse existing '{settings.atlas_name}' if compatible", icon='INFO')
+                box.label(text=f"♻️ Will reuse existing '{preview_name}' if compatible", icon='INFO')
         
         col.prop(settings, "save_atlas_file")
         if settings.save_atlas_file:
             col.prop(settings, "atlas_format")
+            col.prop(settings, "output_dir")
         
         # === ATLAS SIZE SETTINGS ===
         layout.separator()
@@ -937,6 +1149,8 @@ class UV_ATLAS_PT_panel(Panel):
         col.prop(settings, "padding")
         if settings.packing_algorithm == 'BEST_FIT':
             col.prop(settings, "allow_region_rotation")
+            if settings.allow_region_rotation:
+                col.prop(settings, "rotation_safe_only")
         
         # === ADVANCED OPTIONS ===
         layout.separator()
@@ -957,10 +1171,14 @@ class UV_ATLAS_PT_panel(Panel):
             box.label(text="Output:", icon='EXPORT')
             col = box.column(align=True)
             col.prop(settings, "atlas_name")
+            col.prop(settings, "atlas_name_preset")
+            if settings.atlas_name_preset == 'CUSTOM':
+                col.prop(settings, "atlas_name_template")
             col.prop(settings, "atlas_name_handling")
             col.prop(settings, "save_atlas_file")
             if settings.save_atlas_file:
                 col.prop(settings, "atlas_format")
+                col.prop(settings, "output_dir")
             
             # Material Settings
             box.label(text="Materials:", icon='MATERIAL')

@@ -14,7 +14,9 @@ A powerful Blender addon that generates optimized UV atlases with automatic mirr
 ## ✨ Features
 
 - **Automatic Mirror Detection** - Detects mirrored UV faces and handles them properly
-- **Smart Texture Packing** - Multiple packing algorithms for optimal space usage
+- **Smart Texture Packing** - MaxRects bin-packing with optional rotation
+- **Batch Processing** - Generate atlases for multiple selected mesh objects
+- **Flexible Naming & Output** - Output directory and naming presets/templates
 - **Flexible Atlas Sizing** - Power-of-2, non-power-of-2, and rectangular atlas support
 - **Quality Presets** - Game Ready, High Quality, Mobile, and Custom presets
 - **Advanced UV Processing** - Proper texture sampling with wrapping modes
@@ -28,13 +30,13 @@ A powerful Blender addon that generates optimized UV atlases with automatic mirr
 1. **Download the addon:**
    - Click the green "Code" button above → "Download ZIP"
    - Extract the ZIP file
-   - Locate `uv_atlas_addon.py`
+   - Locate the `uv_atlas_generator` folder
 
 2. **Install in Blender:**
    - Open Blender
    - Go to `Edit` → `Preferences` → `Add-ons`
    - Click `Install...`
-   - Select `uv_atlas_addon.py`
+   - Select the ZIP you downloaded (or the `uv_atlas_generator` folder)
    - Enable "UV: UV Atlas Generator"
 
 3. **Find the addon:**
@@ -45,7 +47,7 @@ A powerful Blender addon that generates optimized UV atlases with automatic mirr
 ### Alternative: Release Download
 
 1. Go to [Releases](../../releases)
-2. Download `uv_atlas_addon.py` from the latest release
+2. Download the addon ZIP from the latest release
 3. Follow installation steps above
 
 ## 📋 Requirements
@@ -83,9 +85,9 @@ Select Mesh → Configure Settings → Generate Atlas → New Material Applied
 
 ### Packing Algorithms
 
-- **Simple Rows** - Pack in rows (fastest)
-- **Size Sorted** - Sort by size before packing (recommended)
-- **Best Fit** - Minimize wasted space (highest quality)
+- **Insertion Order** - MaxRects packing using original order
+- **Size Sorted** - MaxRects packing, sorted by area (recommended)
+- **Best Fit** - MaxRects packing, sorted by long edge
 
 ### Atlas Sizing
 
@@ -158,6 +160,11 @@ cd blender-uv-atlas-generator
 - Quality presets
 - Advanced configuration options
 - Debug mode and console output
+
+### v1.1.0
+- MaxRects bin-packing with rotation safety
+- Multi-object batch atlas generation
+- Output directory selection and naming presets/templates
 
 ## 📄 License
 
