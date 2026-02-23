@@ -44,6 +44,16 @@ class UVAtlasSettings(PropertyGroup):
         description="Allow atlas sizes that aren't powers of 2",
         default=False
     )
+
+    batch_mode: EnumProperty(
+        name="Batch Mode",
+        description="How to handle multiple selected objects",
+        items=[
+            ('PER_OBJECT', "Per Object", "Generate one atlas per selected object"),
+            ('COMBINED', "Combined", "Generate a single atlas shared by all selected objects"),
+        ],
+        default='PER_OBJECT'
+    )
     
     # === TEXTURE PROCESSING ===
     mirror_detection_mode: EnumProperty(
@@ -347,6 +357,10 @@ class UV_ATLAS_OT_generate(Operator):
         if not objs:
             raise Exception("No mesh objects selected")
 
+        if settings.batch_mode == 'COMBINED':
+            self.generate_atlas_combined(objs, settings)
+            return
+
         for obj in objs:
             if not obj.data.materials:
                 raise Exception(f"Object has no materials: {obj.name}")
@@ -372,7 +386,7 @@ class UV_ATLAS_OT_generate(Operator):
                     print(f"Found {len(material_groups)} unique textures")
                 
                 # Create texture regions
-                total_regions = self.create_texture_regions(material_groups, settings, uv_layer)
+                total_regions = self.create_texture_regions(material_groups, settings)
                 
                 if not total_regions:
                     raise Exception(f"No texture regions created for {obj.name}")
@@ -422,7 +436,81 @@ class UV_ATLAS_OT_generate(Operator):
             finally:
                 if bm.is_valid:
                     bm.free()
-    
+
+    def generate_atlas_combined(self, objs, settings):
+        """Generate a single atlas shared by all selected mesh objects."""
+        obj_data = []
+        material_groups = defaultdict(lambda: {'regular': [], 'mirrored': []})
+
+        try:
+            for obj in objs:
+                if not obj.data.materials:
+                    raise Exception(f"Object has no materials: {obj.name}")
+
+                mesh = obj.data
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                uv_layer = bm.loops.layers.uv.verify()
+                bm.faces.ensure_lookup_table()
+
+                if settings.debug_mode:
+                    print(f"Processing mesh: {obj.name}")
+                    print(f"Faces: {len(bm.faces)}, Materials: {len(obj.data.materials)}")
+
+                groups = self.group_faces_by_material(bm, obj, uv_layer, settings)
+                for img_name, grp in groups.items():
+                    material_groups[img_name]['regular'].extend(grp['regular'])
+                    material_groups[img_name]['mirrored'].extend(grp['mirrored'])
+
+                obj_data.append((obj, bm, uv_layer))
+
+            if not material_groups:
+                raise Exception("No valid materials with textures found")
+
+            if settings.debug_mode:
+                print(f"Found {len(material_groups)} unique textures across selection")
+
+            total_regions = self.create_texture_regions(material_groups, settings)
+            if not total_regions:
+                raise Exception("No texture regions created")
+
+            atlas_size = self.calculate_atlas_size(total_regions, settings)
+            if settings.debug_mode:
+                if isinstance(atlas_size, tuple):
+                    print(f"Using atlas size: {atlas_size[0]}x{atlas_size[1]}")
+                else:
+                    print(f"Using atlas size: {atlas_size}x{atlas_size}")
+
+            atlas_image, atlas_regions = self.build_atlas(total_regions, atlas_size, settings, None)
+
+            if isinstance(atlas_size, tuple):
+                atlas_width, atlas_height = atlas_size
+            else:
+                atlas_width = atlas_height = atlas_size
+
+            # Remap UVs across all meshes
+            self.remap_uvs(atlas_regions, None, None, atlas_width, atlas_height, settings)
+
+            # Apply materials and write meshes
+            for obj, bm, _ in obj_data:
+                if settings.create_debug_materials:
+                    self.apply_debug_materials(obj, bm, atlas_regions, settings)
+                elif settings.create_new_material:
+                    self.apply_atlas_material(obj, bm, atlas_image, settings)
+
+                bm.to_mesh(obj.data)
+
+            efficiency = (sum(r['width'] * r['height'] for r in total_regions) / (atlas_width * atlas_height)) * 100
+            if settings.debug_mode:
+                print("✅ Combined atlas complete!")
+                print(f"📊 Final atlas size: {atlas_width}x{atlas_height}")
+                print(f"📦 Total regions packed: {len(total_regions)}")
+                print(f"📈 Atlas efficiency: {efficiency:.1f}%")
+        finally:
+            for _, bm, _ in obj_data:
+                if bm.is_valid:
+                    bm.free()
+
     def is_face_uv_mirrored(self, face, uv_layer):
         """Check if face has mirrored UV coordinates (negative winding)"""
         uvs = [loop[uv_layer].uv for loop in face.loops]
@@ -470,7 +558,8 @@ class UV_ATLAS_OT_generate(Operator):
                 'face': face,
                 'image': img,
                 'material': mat,
-                'face_index': face.index
+                'face_index': face.index,
+                'uv_layer': uv_layer
             }
             
             # Determine if this face should be mirrored based on settings
@@ -500,12 +589,12 @@ class UV_ATLAS_OT_generate(Operator):
             return uv.x, uv.y
         return uv.x % 1.0, uv.y % 1.0
 
-    def compute_uv_bounds(self, face_group, uv_layer, settings):
+    def compute_uv_bounds(self, face_group, settings):
         """Compute UV bounds for a group of faces"""
         all_uvs = []
         for item in face_group:
             for loop in item['face'].loops:
-                u, v = self.normalize_uv(loop[uv_layer].uv, settings)
+                u, v = self.normalize_uv(loop[item['uv_layer']].uv, settings)
                 all_uvs.append((u, v))
         
         if not all_uvs:
@@ -572,7 +661,7 @@ class UV_ATLAS_OT_generate(Operator):
         
         return region_pixels, region_w, region_h
     
-    def create_texture_regions(self, material_groups, settings, uv_layer):
+    def create_texture_regions(self, material_groups, settings):
         """Create texture regions for all materials"""
         total_regions = []
         
@@ -585,8 +674,8 @@ class UV_ATLAS_OT_generate(Operator):
             
             # Process regular faces
             if groups['regular']:
-                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['regular'], uv_layer, settings)
-                allow_rotate = self.is_region_rotation_safe(groups['regular'], uv_layer) if settings.rotation_safe_only else True
+                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['regular'], settings)
+                allow_rotate = self.is_region_rotation_safe(groups['regular']) if settings.rotation_safe_only else True
                 region_pixels, region_w, region_h = self.create_region_texture(
                     src_pixels, img.size, u_min, u_max, v_min, v_max, settings, region_type='regular'
                 )
@@ -606,8 +695,8 @@ class UV_ATLAS_OT_generate(Operator):
             
             # Process mirrored faces (horizontally flipped)
             if groups['mirrored']:
-                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['mirrored'], uv_layer, settings)
-                allow_rotate = self.is_region_rotation_safe(groups['mirrored'], uv_layer) if settings.rotation_safe_only else True
+                u_min, u_max, v_min, v_max = self.compute_uv_bounds(groups['mirrored'], settings)
+                allow_rotate = self.is_region_rotation_safe(groups['mirrored']) if settings.rotation_safe_only else True
                 region_pixels, region_w, region_h = self.create_region_texture(
                     src_pixels, img.size, u_min, u_max, v_min, v_max, settings, region_type='mirrored'
                 )
@@ -718,7 +807,7 @@ class UV_ATLAS_OT_generate(Operator):
         import time
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         return template.format(
-            object=obj.name if obj else "Object",
+            object=obj.name if obj else "Combined",
             atlas=settings.atlas_name,
             timestamp=timestamp
         )
@@ -843,7 +932,7 @@ class UV_ATLAS_OT_generate(Operator):
 
         return placements
 
-    def is_region_rotation_safe(self, face_group, uv_layer, tol=1e-6):
+    def is_region_rotation_safe(self, face_group, tol=1e-6):
         """Only allow rotation if all UV edges are axis-aligned."""
         for item in face_group:
             face = item['face']
@@ -851,6 +940,7 @@ class UV_ATLAS_OT_generate(Operator):
             if len(loops) < 3:
                 continue
             for i in range(len(loops)):
+                uv_layer = item['uv_layer']
                 uv1 = loops[i][uv_layer].uv
                 uv2 = loops[(i + 1) % len(loops)][uv_layer].uv
                 du = abs(uv2.x - uv1.x)
@@ -963,6 +1053,7 @@ class UV_ATLAS_OT_generate(Operator):
             for item in region['faces']:
                 face = item['face']
                 for loop in face.loops:
+                    uv_layer = item.get('uv_layer', uv_layer)
                     old_uv = loop[uv_layer].uv
                     if settings.normalize_uv_ranges:
                         old_u, old_v = self.normalize_uv(old_uv, settings)
@@ -1110,6 +1201,7 @@ class UV_ATLAS_PT_panel(Panel):
         layout.label(text="Atlas Settings:", icon='IMAGE_DATA')
         
         col = layout.column(align=True)
+        col.prop(settings, "batch_mode")
         col.prop(settings, "max_atlas_size")
         
         row = col.row(align=True)
