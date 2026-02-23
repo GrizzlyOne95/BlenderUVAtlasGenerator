@@ -166,6 +166,10 @@ cd blender-uv-atlas-generator
 - Multi-object batch atlas generation
 - Output directory selection and naming presets/templates
 
+### v1.1.1
+- Combined batch mode (single atlas shared by all selected meshes)
+- Fixed syntax/indentation issues in combined mode
+
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
