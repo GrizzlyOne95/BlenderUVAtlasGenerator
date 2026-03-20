@@ -2,7 +2,7 @@ bl_info = {
     "name": "UV Atlas Generator",
     "blender": (3, 6, 0),
     "category": "UV",
-    "version": (1, 0, 0),
+    "version": (1, 1, 1),
     "author": "GrizzlyOne95",
     "description": "Generate optimized UV atlas from Blender materials",
     "location": "View3D > Sidebar > UV Atlas",
@@ -16,9 +16,74 @@ import bpy
 import bmesh
 import math
 import numpy as np
+import os
+import time
 from collections import defaultdict
+from string import Formatter
 from bpy.props import IntProperty, BoolProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup
+
+ATLAS_NAME_TEMPLATE_PRESETS = {
+    'ATLAS': "{atlas}",
+    'OBJECT_ATLAS': "{object}_{atlas}",
+    'OBJECT_TIMESTAMP': "{object}_{timestamp}",
+    'ATLAS_TIMESTAMP': "{atlas}_{timestamp}",
+}
+
+ATLAS_NAME_TEMPLATE_FIELDS = {"object", "atlas", "timestamp"}
+
+
+def get_atlas_name_template(settings):
+    if settings.atlas_name_preset == 'CUSTOM':
+        return settings.atlas_name_template
+    return ATLAS_NAME_TEMPLATE_PRESETS.get(settings.atlas_name_preset, "{object}_{atlas}")
+
+
+def validate_atlas_name_template(template):
+    try:
+        for _, field_name, format_spec, conversion in Formatter().parse(template):
+            if field_name is None:
+                continue
+            if field_name not in ATLAS_NAME_TEMPLATE_FIELDS:
+                return False, f"Unknown template field '{field_name}'"
+            if conversion:
+                return False, "Template conversions are not supported"
+            if format_spec:
+                return False, "Template format specifiers are not supported"
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def template_uses_field(template, field_name):
+    try:
+        for _, parsed_field_name, _, _ in Formatter().parse(template):
+            if parsed_field_name == field_name:
+                return True
+    except ValueError:
+        return False
+    return False
+
+
+def format_atlas_name(settings, object_name, timestamp=None):
+    template = get_atlas_name_template(settings)
+    is_valid, error = validate_atlas_name_template(template)
+    if not is_valid:
+        raise ValueError(f"Invalid atlas name template: {error}")
+
+    if timestamp is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    return template.format(
+        object=object_name or "Combined",
+        atlas=settings.atlas_name.strip() or "Atlas",
+        timestamp=timestamp
+    )
+
+
+class AtlasValidationError(ValueError):
+    """User-facing validation error for addon settings or inputs."""
+    pass
 
 class UVAtlasSettings(PropertyGroup):
     """Settings for UV Atlas Generator"""
@@ -251,7 +316,7 @@ class UVAtlasSettings(PropertyGroup):
     debug_mode: BoolProperty(
         name="Debug Mode",
         description="Print debug information to console",
-        default=True
+        default=False
     )
     
     show_advanced_options: BoolProperty(
@@ -287,6 +352,7 @@ class UV_ATLAS_OT_preset(Operator):
             settings.texture_wrap_mode = 'REPEAT'
             settings.maintain_aspect_ratio = True
             settings.merge_identical_uvs = True
+            settings.allow_region_rotation = False
             settings.atlas_name_handling = 'CREATE_NEW'
             
         elif self.preset == 'HIGH_QUALITY':
@@ -312,6 +378,7 @@ class UV_ATLAS_OT_preset(Operator):
             settings.texture_wrap_mode = 'CLAMP'
             settings.maintain_aspect_ratio = False
             settings.merge_identical_uvs = True
+            settings.allow_region_rotation = False
             settings.atlas_name_handling = 'OVERWRITE'
             
         elif self.preset == 'CUSTOM':
@@ -322,6 +389,7 @@ class UV_ATLAS_OT_preset(Operator):
             settings.packing_algorithm = 'SIZE_SORTED'
             settings.mirror_detection_mode = 'AUTO'
             settings.show_advanced_options = True
+            settings.allow_region_rotation = False
             settings.atlas_name_handling = 'CREATE_NEW'
         
         self.report({'INFO'}, f"Applied {self.preset} preset")
@@ -344,12 +412,42 @@ class UV_ATLAS_OT_generate(Operator):
         settings = context.scene.uv_atlas_settings
         
         try:
+            self.validate_generation_settings(context, settings)
             self.generate_atlas(context, settings)
             self.report({'INFO'}, "UV Atlas generated successfully!")
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Error generating atlas: {str(e)}")
             return {'CANCELLED'}
+
+    def validate_generation_settings(self, context, settings):
+        """Validate user-facing settings before doing any heavy work."""
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs:
+            raise AtlasValidationError("No mesh objects selected")
+
+        format_atlas_name(settings, "Combined" if settings.batch_mode == 'COMBINED' else context.object.name)
+
+        if settings.save_atlas_file:
+            self.resolve_output_base_path(settings)
+
+    def resolve_output_base_path(self, settings):
+        """Resolve and validate the atlas output directory."""
+        if settings.output_dir:
+            base_path = bpy.path.abspath(settings.output_dir)
+            if not os.path.isdir(base_path):
+                os.makedirs(base_path, exist_ok=True)
+            return base_path
+
+        if not bpy.data.is_saved:
+            raise AtlasValidationError(
+                "Save the .blend file or choose an Output Directory before saving atlas files"
+            )
+
+        blend_dir = bpy.path.abspath("//")
+        if not os.path.isdir(blend_dir):
+            os.makedirs(blend_dir, exist_ok=True)
+        return blend_dir
     
     def generate_atlas(self, context, settings):
         """Main atlas generation function"""
@@ -535,6 +633,69 @@ class UV_ATLAS_OT_generate(Operator):
         x = max(0, min(width - 1, x))
         y = max(0, min(height - 1, y))
         return src_pixels[y, x]
+
+    def find_linked_image_node(self, node, visited=None):
+        """Recursively search upstream for an image texture node."""
+        if node is None:
+            return None
+
+        if visited is None:
+            visited = set()
+
+        node_id = id(node)
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+
+        if node.type == 'TEX_IMAGE' and getattr(node, "image", None):
+            return node
+
+        for input_socket in getattr(node, "inputs", []):
+            for link in input_socket.links:
+                image_node = self.find_linked_image_node(link.from_node, visited)
+                if image_node is not None:
+                    return image_node
+        return None
+
+    def resolve_material_image(self, material):
+        """Resolve the image that most likely drives the visible shader color."""
+        if not material or not material.use_nodes or not material.node_tree:
+            return None
+
+        nodes = material.node_tree.nodes
+        output_nodes = [node for node in nodes if node.type == 'OUTPUT_MATERIAL' and getattr(node, "is_active_output", False)]
+        if not output_nodes:
+            output_nodes = [node for node in nodes if node.type == 'OUTPUT_MATERIAL']
+
+        for output_node in output_nodes:
+            surface_input = output_node.inputs.get("Surface")
+            if surface_input is None:
+                continue
+
+            for link in surface_input.links:
+                shader_node = link.from_node
+                if shader_node is None:
+                    continue
+
+                base_color_input = shader_node.inputs.get("Base Color") if hasattr(shader_node, "inputs") else None
+                if base_color_input and base_color_input.is_linked:
+                    base_color_node = self.find_linked_image_node(base_color_input.links[0].from_node)
+                    if base_color_node and base_color_node.image and base_color_node.image.has_data:
+                        return base_color_node.image
+
+                linked_image_node = self.find_linked_image_node(shader_node)
+                if linked_image_node and linked_image_node.image and linked_image_node.image.has_data:
+                    return linked_image_node.image
+
+        active_node = nodes.active
+        if active_node and active_node.type == 'TEX_IMAGE' and active_node.image and active_node.image.has_data:
+            return active_node.image
+
+        for node in nodes:
+            if node.type == 'TEX_IMAGE' and node.image and node.image.has_data:
+                return node.image
+
+        return None
     
     def group_faces_by_material(self, bm, obj, uv_layer, settings):
         """Group faces by image and detect mirroring needs"""
@@ -545,12 +706,8 @@ class UV_ATLAS_OT_generate(Operator):
             mat = obj.data.materials[mat_idx] if mat_idx < len(obj.data.materials) else None
             if not mat or not mat.use_nodes:
                 continue
-            
-            img_nodes = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE']
-            if not img_nodes:
-                continue
-            
-            img = img_nodes[0].image
+
+            img = self.resolve_material_image(mat)
             if not img or not img.has_data:
                 continue
             
@@ -638,27 +795,30 @@ class UV_ATLAS_OT_generate(Operator):
             # Force to target size, ignoring aspect ratio
             region_w = settings.target_region_size
             region_h = settings.target_region_size
-        
-        region_pixels = np.zeros((region_h, region_w, 4), dtype=np.float32)
-        
-        for row in range(region_h):
-            for col in range(region_w):
-                u_norm = col / max(1, region_w - 1)
-                v_norm = row / max(1, region_h - 1)
 
-                if flip_u: 
-                    u_norm = 1.0 - u_norm
-                if flip_v: 
-                    v_norm = 1.0 - v_norm
+        x_coords = np.linspace(0.0, 1.0, num=region_w, dtype=np.float32) if region_w > 1 else np.array([0.0], dtype=np.float32)
+        y_coords = np.linspace(0.0, 1.0, num=region_h, dtype=np.float32) if region_h > 1 else np.array([0.0], dtype=np.float32)
+        u_norm, v_norm = np.meshgrid(x_coords, y_coords)
 
-                src_u = u_min + u_norm * u_range
-                src_v = v_min + v_norm * v_range
+        if flip_u:
+            u_norm = 1.0 - u_norm
+        if flip_v:
+            v_norm = 1.0 - v_norm
 
-                region_pixels[row, col] = self.sample_texture(
-                    src_pixels, src_u, src_v, img_size[0], img_size[1], 
-                    wrap_mode=settings.texture_wrap_mode
-                )
-        
+        src_u = u_min + u_norm * u_range
+        src_v = v_min + v_norm * v_range
+
+        if settings.texture_wrap_mode == 'REPEAT':
+            src_u = np.mod(src_u, 1.0)
+            src_v = np.mod(src_v, 1.0)
+        else:
+            src_u = np.clip(src_u, 0.0, 1.0)
+            src_v = np.clip(src_v, 0.0, 1.0)
+
+        x_indices = np.clip((src_u * img_size[0]).astype(np.int32), 0, img_size[0] - 1)
+        y_indices = np.clip((src_v * img_size[1]).astype(np.int32), 0, img_size[1] - 1)
+        region_pixels = src_pixels[y_indices, x_indices]
+
         return region_pixels, region_w, region_h
     
     def create_texture_regions(self, material_groups, settings):
@@ -670,7 +830,9 @@ class UV_ATLAS_OT_generate(Operator):
                 continue
             
             img = (groups['regular'] + groups['mirrored'])[0]['image']
-            src_pixels = np.array(img.pixels[:]).reshape((img.size[1], img.size[0], 4))
+            src_pixels_flat = np.empty(img.size[0] * img.size[1] * 4, dtype=np.float32)
+            img.pixels.foreach_get(src_pixels_flat)
+            src_pixels = src_pixels_flat.reshape((img.size[1], img.size[0], 4))
             
             # Process regular faces
             if groups['regular']:
@@ -792,25 +954,7 @@ class UV_ATLAS_OT_generate(Operator):
         return atlas_size if isinstance(atlas_size, int) else min(atlas_size, settings.max_atlas_size)
     
     def build_atlas_name(self, settings, obj):
-        template = settings.atlas_name_template
-        if settings.atlas_name_preset == 'ATLAS':
-            template = "{atlas}"
-        elif settings.atlas_name_preset == 'OBJECT_ATLAS':
-            template = "{object}_{atlas}"
-        elif settings.atlas_name_preset == 'OBJECT_TIMESTAMP':
-            template = "{object}_{timestamp}"
-        elif settings.atlas_name_preset == 'ATLAS_TIMESTAMP':
-            template = "{atlas}_{timestamp}"
-        elif settings.atlas_name_preset == 'CUSTOM':
-            template = settings.atlas_name_template
-
-        import time
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        return template.format(
-            object=obj.name if obj else "Combined",
-            atlas=settings.atlas_name,
-            timestamp=timestamp
-        )
+        return format_atlas_name(settings, obj.name if obj else "Combined")
 
     def get_or_create_atlas_image(self, settings, atlas_width, atlas_height, obj=None):
         """Create or reuse atlas image based on name handling settings."""
@@ -820,9 +964,11 @@ class UV_ATLAS_OT_generate(Operator):
         if existing_image:
             if settings.atlas_name_handling == 'OVERWRITE':
                 if settings.debug_mode:
-                    print(f"🗑️ Removing existing image: {base_name}")
-                bpy.data.images.remove(existing_image)
-                existing_image = None
+                    print(f"Updating existing image: {base_name}")
+                if (existing_image.size[0] != atlas_width or
+                    existing_image.size[1] != atlas_height):
+                    existing_image.scale(atlas_width, atlas_height)
+                return existing_image, base_name
             elif settings.atlas_name_handling == 'USE_EXISTING':
                 if (existing_image.size[0] == atlas_width and 
                     existing_image.size[1] == atlas_height):
@@ -1010,13 +1156,7 @@ class UV_ATLAS_OT_generate(Operator):
             region_pixels = region['pixels']
             if rotated:
                 region_pixels = np.rot90(region_pixels)
-
-            for row in range(ph):
-                for col in range(pw):
-                    atlas_x = px + col
-                    atlas_y = py + row
-                    if atlas_x < atlas_width and atlas_y < atlas_height:
-                        atlas_pixels[atlas_y, atlas_x] = region_pixels[row, col]
+            atlas_pixels[py:py + ph, px:px + pw] = region_pixels[:ph, :pw]
 
             # Store region info for UV remapping
             region_key = f"{region['img_name']}_{region['type']}"
@@ -1031,14 +1171,13 @@ class UV_ATLAS_OT_generate(Operator):
             }
         
         # Write pixels to Blender image
-        atlas_image.pixels = atlas_pixels.flatten().tolist()
+        atlas_image.pixels.foreach_set(np.ascontiguousarray(atlas_pixels, dtype=np.float32).ravel())
+        atlas_image.update()
         
         # Save atlas file if requested
         if settings.save_atlas_file:
-            base_path = settings.output_dir if settings.output_dir else "//"
-            if base_path and not base_path.endswith(("/", "\\")):
-                base_path = base_path + "/"
-            atlas_image.filepath_raw = f"{base_path}{final_atlas_name}.{settings.atlas_format.lower()}"
+            base_path = self.resolve_output_base_path(settings)
+            atlas_image.filepath_raw = os.path.join(base_path, f"{final_atlas_name}.{settings.atlas_format.lower()}")
             atlas_image.file_format = settings.atlas_format
             atlas_image.save()
         
@@ -1151,6 +1290,15 @@ class UV_ATLAS_PT_panel(Panel):
         else:
             layout.label(text="Select a mesh object", icon='ERROR')
             return
+
+        preview_object_name = "Combined" if settings.batch_mode == 'COMBINED' else obj.name
+        preview_template = get_atlas_name_template(settings)
+        preview_name = None
+        preview_error = None
+        try:
+            preview_name = format_atlas_name(settings, preview_object_name, timestamp="YYYYMMDD_HHMMSS")
+        except ValueError as exc:
+            preview_error = str(exc)
         
         # === OUTPUT CONTROL ===
         layout.separator()
@@ -1162,39 +1310,28 @@ class UV_ATLAS_PT_panel(Panel):
         if settings.atlas_name_preset == 'CUSTOM':
             col.prop(settings, "atlas_name_template")
         col.prop(settings, "atlas_name_handling")
-        
-        # Show info about name handling
-        template = settings.atlas_name_template
-        if settings.atlas_name_preset == 'ATLAS':
-            template = "{atlas}"
-        elif settings.atlas_name_preset == 'OBJECT_ATLAS':
-            template = "{object}_{atlas}"
-        elif settings.atlas_name_preset == 'OBJECT_TIMESTAMP':
-            template = "{object}_{timestamp}"
-        elif settings.atlas_name_preset == 'ATLAS_TIMESTAMP':
-            template = "{atlas}_{timestamp}"
-        elif settings.atlas_name_preset == 'CUSTOM':
-            template = settings.atlas_name_template
 
-        preview_name = template.format(
-            object=obj.name if obj else "Object",
-            atlas=settings.atlas_name,
-            timestamp="YYYYMMDD_HHMMSS"
-        )
-        existing_img = bpy.data.images.get(preview_name)
-        if existing_img:
-            box = layout.box()
-            if settings.atlas_name_handling == 'OVERWRITE':
-                box.label(text=f"⚠️ Will overwrite existing '{preview_name}'", icon='ERROR')
-            elif settings.atlas_name_handling == 'CREATE_NEW':
-                box.label(text=f"📝 Will create new name (e.g. '{preview_name}.001')", icon='INFO')
-            elif settings.atlas_name_handling == 'USE_EXISTING':
-                box.label(text=f"♻️ Will reuse existing '{preview_name}' if compatible", icon='INFO')
+        box = layout.box()
+        if preview_error:
+            box.label(text=preview_error, icon='ERROR')
+        else:
+            box.label(text=f"Resolved Name: {preview_name}", icon='INFO')
+            if not template_uses_field(preview_template, "timestamp"):
+                existing_img = bpy.data.images.get(preview_name)
+                if existing_img:
+                    if settings.atlas_name_handling == 'OVERWRITE':
+                        box.label(text=f"Will update existing '{preview_name}'", icon='ERROR')
+                    elif settings.atlas_name_handling == 'CREATE_NEW':
+                        box.label(text=f"Will create '{preview_name}.001' or next free name", icon='INFO')
+                    elif settings.atlas_name_handling == 'USE_EXISTING':
+                        box.label(text=f"Will reuse existing '{preview_name}' if compatible", icon='INFO')
         
         col.prop(settings, "save_atlas_file")
         if settings.save_atlas_file:
             col.prop(settings, "atlas_format")
             col.prop(settings, "output_dir")
+            if not settings.output_dir and not bpy.data.is_saved:
+                box.label(text="Save the .blend or choose an Output Directory", icon='ERROR')
         
         # === ATLAS SIZE SETTINGS ===
         layout.separator()
@@ -1239,10 +1376,9 @@ class UV_ATLAS_PT_panel(Panel):
         col = layout.column(align=True)
         col.prop(settings, "packing_algorithm")
         col.prop(settings, "padding")
-        if settings.packing_algorithm == 'BEST_FIT':
-            col.prop(settings, "allow_region_rotation")
-            if settings.allow_region_rotation:
-                col.prop(settings, "rotation_safe_only")
+        col.prop(settings, "allow_region_rotation")
+        if settings.allow_region_rotation:
+            col.prop(settings, "rotation_safe_only")
         
         # === ADVANCED OPTIONS ===
         layout.separator()
@@ -1258,19 +1394,6 @@ class UV_ATLAS_PT_panel(Panel):
             col.prop(settings, "normalize_uv_ranges")
             col.prop(settings, "merge_identical_uvs")
             col.prop(settings, "uv_precision")
-            
-            # Output Settings
-            box.label(text="Output:", icon='EXPORT')
-            col = box.column(align=True)
-            col.prop(settings, "atlas_name")
-            col.prop(settings, "atlas_name_preset")
-            if settings.atlas_name_preset == 'CUSTOM':
-                col.prop(settings, "atlas_name_template")
-            col.prop(settings, "atlas_name_handling")
-            col.prop(settings, "save_atlas_file")
-            if settings.save_atlas_file:
-                col.prop(settings, "atlas_format")
-                col.prop(settings, "output_dir")
             
             # Material Settings
             box.label(text="Materials:", icon='MATERIAL')
