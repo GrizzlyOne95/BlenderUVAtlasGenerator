@@ -1,0 +1,44 @@
+name: Release UV Atlas Generator
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify source version matches tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          grep -F "\"version\": ($MAJOR, $MINOR, $PATCH)" uv_atlas_generator/__init__.py
+
+      - name: Verify Python syntax
+        run: python -m py_compile uv_atlas_generator/__init__.py
+
+      - name: Build Blender add-on ZIP
+        shell: bash
+        run: |
+          zip -r "uv_atlas_generator-${GITHUB_REF_NAME}.zip" uv_atlas_generator/
+          test "$(stat -c%s "uv_atlas_generator-${GITHUB_REF_NAME}.zip")" -gt 5000
+          unzip -l "uv_atlas_generator-${GITHUB_REF_NAME}.zip" | grep -F 'uv_atlas_generator/__init__.py'
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body_path: docs/RELEASE_NOTES_${{ github.ref_name }}.md
+          files: uv_atlas_generator-${{ github.ref_name }}.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
