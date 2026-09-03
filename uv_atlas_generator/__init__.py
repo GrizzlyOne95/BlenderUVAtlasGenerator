@@ -2,7 +2,7 @@ bl_info = {
     "name": "UV Atlas Generator",
     "blender": (3, 6, 0),
     "category": "UV",
-    "version": (1, 1, 1),
+    "version": (1, 2, 0),
     "author": "GrizzlyOne95",
     "description": "Generate optimized UV atlas from Blender materials",
     "location": "View3D > Sidebar > UV Atlas",
